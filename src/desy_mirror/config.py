@@ -1,6 +1,5 @@
 import dataclasses as dc
 import logging
-from pathlib import Path
 
 from wipac_dev_tools import from_environment_as_dataclass
 

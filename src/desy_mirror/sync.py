@@ -3,7 +3,6 @@ import base64
 from enum import Enum
 import hashlib
 import logging
-import os
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
@@ -143,7 +142,7 @@ class Sync:
                 request_timeout=timeout,
                 streaming_callback=f.write,
             )
-            ret = await self.http_client.fetch(req)
+            await self.http_client.fetch(req)
 
     async def rmfile(self, path: str, timeout=600):
         logging.info('RMFILE %s', path)
