@@ -1,0 +1,125 @@
+name: wipac ci/cd
+
+on:
+  push:
+    branches:
+      - '**'
+    tags-ignore:
+      - '**'
+
+env:
+  py_version: '3.12'
+
+jobs:
+
+  flake8:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/ruff-action@v3
+
+  py-versions:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.versions.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: versions
+        uses: WIPACrepo/wipac-dev-py-versions-action@v2.5
+
+  pip-install:
+    needs: [py-versions]
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 4
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.py-versions.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.version }}
+      - run: |
+          pip install --upgrade pip wheel setuptools
+          pip install .
+
+  docker-build:
+    name: "Docker Image"
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Project
+      uses: actions/checkout@v4
+    - name: Build Docker Image
+      uses: docker/build-push-action@v4
+      with:
+        context: .
+        push: false
+
+  release:
+    if: ${{ github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' }}
+    needs: [flake8, pip-install, docker-build]
+    runs-on: ubuntu-latest
+    concurrency: release
+
+    permissions:
+      id-token: write
+      contents: write
+      packages: write
+
+    steps:
+      # Note: we need to checkout the repository at the workflow sha in case during the workflow
+      # the branch was updated. To keep PSR working with the configured release branches,
+      # we force a checkout of the desired release branch but at the workflow sha HEAD.
+      - name: Setup | Checkout Repository at workflow sha
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Setup | Force correct release branch on workflow sha
+        run: |
+          git checkout -B ${{ github.ref_name }} ${{ github.sha }}
+
+      - name: Action | Semantic Version Release
+        id: release
+        # Adjust tag with desired version if applicable.
+        uses: python-semantic-release/python-semantic-release@v9.8.1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          git_committer_name: "github-actions"
+          git_committer_email: "actions@users.noreply.github.com"
+
+      - name: Publish | Upload to GitHub Release Assets
+        uses: python-semantic-release/publish-action@v9.16.1
+        if: steps.release.outputs.released == 'true'
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ steps.release.outputs.tag }}
+
+      - name: Docker meta
+        id: docker_meta
+        if: steps.release.outputs.released == 'true'
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/wipacrepo/desy-mirror
+          tags: |
+            type=semver,pattern={{major}},value=${{ steps.release.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.release.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}}.{{patch}},value=${{ steps.release.outputs.tag }}
+      - name: Login to GitHub Container Registry
+        if: steps.release.outputs.released == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push Docker Image
+        if: steps.release.outputs.released == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          tags: ${{ steps.docker_meta.outputs.tags }}
+          labels: ${{ steps.docker_meta.outputs.labels }}
+          push: true

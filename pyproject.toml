@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools_scm[toml]>=3.4"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "desy-mirror"
+description = "WIPAC - DESY file mirror"
+readme = "README.md"
+authors = [{name = "WIPAC Developers", email = "developers@icecube.wisc.edu"}]
+keywords = ["transfer"]
+license = {text = "MIT License"}
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+requires-python = ">=3.12"
+dependencies = [
+    "pycurl",
+    "tornado",
+    "wipac-dev-tools",
+    "wipac-rest-tools",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+tests = ["mypy", "pytest", "pytest-async"]
+
+[project.urls]
+repository = "https://github.com/WIPACrepo/desy-mirror"
+
+[tool.setuptools]
+include-package-data = true
+license-files = ["LICENSE"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["desy*"]
+namespaces = true
+
+[tool.setuptools_scm]
+write_to = "src/desy_mirror/version.py"
+
+[tool.ruff]
+exclude = ["env", "*tests", "bin", "docs", "resources"]
+target-version = "py313"
+
+[tool.ruff.lint]
+ignore = ["E203", "E226", "E228", "E231", "E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.semantic_release]
+tag_format = "{version}"
+commit_parser = "emoji"
+
+[tool.semantic_release.commit_parser_options]
+major_tags = ["[major]"]
+minor_tags = ["[minor]", "[feature]"]
+patch_tags = ["[patch]", "[fix]", " ", "!", "#", "$", "%", "&", "'", "(", ")", "*", "+", "-", ".", "/", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", ":", ";", "<", "=", ">", "?", "@", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "[", "]", "^", "_", "`", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "{", "|", "}", "~"]
