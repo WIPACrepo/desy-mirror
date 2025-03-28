@@ -84,8 +84,7 @@ class Sync:
         })
 
     async def run(self):
-        await self.rmtree(Path(ENV.SRC_DIRECTORY))
-        #await self.sync_dir(Path(ENV.SRC_DIRECTORY))
+        await self.sync_dir(Path(ENV.SRC_DIRECTORY))
 
     @connection_semaphore
     async def get_children(self, path):
