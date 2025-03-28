@@ -1,11 +1,13 @@
 import asyncio
 import base64
 from enum import Enum
+from functools import wraps
 import hashlib
 import logging
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
+import pycurl
 from rest_tools.client import ClientCredentialsAuth
 from tornado.httpclient import AsyncHTTPClient, HTTPRequest
 
@@ -16,7 +18,8 @@ AsyncHTTPClient.configure("tornado.curl_httpclient.CurlAsyncHTTPClient")
 
 def setupCurl(c):
     c.setopt(c.CAPATH, '/etc/grid-security/certificates')
-    #c.setopt(c.VERBOSE, True)
+    if ENV.LOG_LEVEL.lower() == 'debug':
+        c.setopt(c.VERBOSE, True)
 
 XMLNS = {
     'd': 'DAV:',
@@ -52,9 +55,18 @@ def sha512sum(filename: Path, blocksize: int = 1024 * 1024 * 2) -> str:
     return h.hexdigest()
 
 
+__semaphore = asyncio.Semaphore(ENV.MAX_PARALLEL)
+
+def connection_semaphore(func):
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        async with __semaphore:
+            return await func(*args, **kwargs)
+    return wrapper
+
+
 class Sync:
     def __init__(self):
-        self.parallel = 0
 
         self.rc = ClientCredentialsAuth(
             address=ENV.DEST_HOST,
@@ -67,14 +79,15 @@ class Sync:
 
         self.http_client = AsyncHTTPClient(max_clients=100, defaults={
             'allow_nonstandard_methods': True,
+            'connect_timeout': 0,
             'prepare_curl_callback': setupCurl,
         })
 
     async def run(self):
-        await self.rmtree(Path(ENV.SRC_DIRECTORY) / '01')
+        await self.rmtree(Path(ENV.SRC_DIRECTORY))
+        #await self.sync_dir(Path(ENV.SRC_DIRECTORY))
 
-        await self.sync_dir(Path(ENV.SRC_DIRECTORY))
-
+    @connection_semaphore
     async def get_children(self, path):
         fullpath = Path(ENV.DEST_PREFIX) / path.lstrip('/')
         self.rc._get_token()
@@ -126,13 +139,13 @@ class Sync:
 
         return children
 
+    @connection_semaphore
     async def get_file(self, path, timeout=1200):
         fullpath = Path(ENV.DEST_PREFIX) / path.lstrip('/')
         self.rc._get_token()
         token = self.rc.access_token
         headers = {
             'Authorization': f'bearer {token}',
-            'Depth': '1',
         }
         with open(path, 'wb') as f:
             req = HTTPRequest(
@@ -144,6 +157,7 @@ class Sync:
             )
             await self.http_client.fetch(req)
 
+    @connection_semaphore
     async def rmfile(self, path: str, timeout=600):
         logging.info('RMFILE %s', path)
         fullpath = Path(ENV.DEST_PREFIX) / path.lstrip('/')
@@ -169,13 +183,15 @@ class Sync:
             await self.rmfile(str(path))
         else:
             children = await self.get_children(str(path))
-            for child in children.values():
-                if child['type'] == DirObject.File:
-                   await self.rmfile(str(path / child['name']))
-                else:
-                    await self.rmtree(path / child['name'])
+            async with asyncio.TaskGroup() as tg:
+                for child in children.values():
+                    if child['type'] == DirObject.File:
+                        tg.create_task(self.rmfile(str(path / child['name'])))
+                    else:
+                        tg.create_task(self.rmtree(path / child['name']))
             await self.rmfile(str(path))
 
+    @connection_semaphore
     async def mkdir(self, path, timeout=60):
         logging.info('MKDIR %s', path)
         fullpath = Path(ENV.DEST_PREFIX) / path.lstrip('/')
@@ -192,9 +208,15 @@ class Sync:
         )
         await self.http_client.fetch(req)
 
+    @connection_semaphore
     async def put_file(self, path, timeout=1200):
+        """
+        Uploads file to a tmp name first, checks the checksum, then
+        moves it to the final location.
+        """
         logging.info('PUT %s', path)
         fullpath = Path(ENV.DEST_PREFIX) / path.lstrip('/')
+        uploadpath = fullpath.with_name('_upload_' + fullpath.name)
         self.rc._get_token()
         token = self.rc.access_token
         filesize = Path(path).stat(follow_symlinks=True).st_size
@@ -206,6 +228,12 @@ class Sync:
         }
 
         with open(path, 'rb') as f:
+            def seek(offset, _origin):
+                try:
+                    f.seek(offset)
+                    return pycurl.SEEKFUNC_OK
+                except Exception:
+                    return pycurl.SEEKFUNC_FAIL
             def cb(c):
                 setupCurl(c)
                 if filesize >= 2000000000:
@@ -214,11 +242,11 @@ class Sync:
                 else:
                     c.setopt(c.INFILESIZE, filesize)
                 c.setopt(c.READDATA, f)
-                c.setopt(c.IOCTLFUNCTION, lambda x: None)
+                c.setopt(c.SEEKFUNCTION, seek)
 
             req = HTTPRequest(
                 method='PUT',
-                url=f'{ENV.DEST_HOST}{fullpath}',
+                url=f'{ENV.DEST_HOST}{uploadpath}',
                 headers=headers,
                 request_timeout=timeout,
                 prepare_curl_callback=cb,
@@ -226,20 +254,44 @@ class Sync:
             ret = await self.http_client.fetch(req)
 
         checksum = ret.headers.get('Digest', None)
+        expected_checksum = sha512sum(path)
         if checksum:
             # we got a checksum back, so compare that directly
             checksum = convert_checksum_from_dcache(checksum)
-            expected = sha512sum(path)
-            if expected == checksum:
-                logging.info("PUT %s complete - checksum successful!", path)
-            else:
-                print(ret.headers)
-                logging.error('PUT %s - bad checksum. expected %s, but received %s', path, expected, checksum)
-                raise RuntimeError('bad checksum!')
         else:
             # read back file, and run checksum manually
-            print(ret.headers)
-            raise NotImplementedError()
+            logging.info("PUT %s - no checksum in headers, so get manually", path)
+            hasher = hashlib.sha512()
+            req = HTTPRequest(
+                method='GET',
+                url=f'{ENV.DEST_HOST}{uploadpath}',
+                headers=headers,
+                request_timeout=timeout,
+                streaming_callback=hasher.update,
+            )
+            await self.http_client.fetch(req)
+            checksum = hasher.hexdigest()
+
+        if expected_checksum == checksum:
+            logging.info("PUT %s complete - checksum successful!", path)
+        else:
+            logging.error('PUT %s - bad checksum. expected %s, but received %s', path, expected_checksum, checksum)
+            raise RuntimeError('bad checksum!')
+
+        self.rc._get_token()
+        token = self.rc.access_token
+        headers = {
+            'Authorization': f'bearer {token}',
+            'Destination': str(fullpath),
+        }
+        req = HTTPRequest(
+            method='MOVE',
+            url=f'{ENV.DEST_HOST}{uploadpath}',
+            headers=headers,
+            request_timeout=timeout,
+            prepare_curl_callback=setupCurl,
+        )
+        await self.http_client.fetch(req)
 
     def get_local_children(self, path: Path):
         children = {}
@@ -271,6 +323,13 @@ class Sync:
         logging.debug('expected children: %s', expected_children)
         logging.debug('actual children: %s', children)
 
+        # delete prev failed uploads
+        async with asyncio.TaskGroup() as tg:
+            for name in sorted(children):
+                if name.startswith('_upload_'):
+                    tg.create_task(self.rmfile(str(path / name)))
+
+        # now upload as necessary
         async with asyncio.TaskGroup() as tg:
             for name in sorted(expected_children):
                 if name in children:
